@@ -103,6 +103,27 @@ exports.createUser = functions.https.onCall(async (data, context) => {
   }
 });
 
+exports.adminCreationRequest = functions.https.onCall(async (data, context) => {
+  try { 
+
+    const json_data = JSON.parse(data);
+
+    //FireStore request data
+    const userCreationRequest = {
+      userDetails: JSON.parse(data),
+      userEmail: json_data.email,
+      status: 'Pending',
+      approvedBy: '',
+      createdOn: FieldValue.serverTimestamp()
+    }
+
+    admin.firestore().collection("userCreationRequests").add(userCreationRequest);
+
+  }catch(error){
+    throw new functions.https.HttpsError('Internal', error.message);
+  } 
+});
+
 // On sign up.
 exports.processSignUp = functions.auth.user().onCreate((user, context) => {
       var customClaims = {};
