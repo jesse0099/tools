@@ -111,7 +111,7 @@ exports.processSignUp = functions.auth.user().onCreate((user, context) => {
       // Create a query against the collection.
       var admin_creation_query = admin_creation_collection.where("userEmail", "==", user.email).get();
 
-      admin_creation_query.then((query_snapshot) => {
+      return admin_creation_query.then((query_snapshot) => {
         if(query_snapshot.empty){
           role = "user";
           customClaims = {
