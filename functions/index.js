@@ -37,7 +37,7 @@ function roleIsValid(role) {
 }
 
 // Admin Creation
-exports.createUser = functions.https.onCall(async (data, context) => {
+exports.adminCreationApproval = functions.https.onCall(async (data, context) => {
   try {
       // Checking that the user calling the Cloud Function is authenticated
       if (!context.auth) {
@@ -64,7 +64,7 @@ exports.createUser = functions.https.onCall(async (data, context) => {
         throw new InvalidRoleError('The "' + role + '" role is not a valid role');
       }
 
-      //FireStore request data
+      //FireStore
       const userCreationRequest = {
         userDetails: data,
         userEmail: json_data.email,
@@ -117,7 +117,7 @@ exports.adminCreationRequest = functions.https.onCall(async (data, context) => {
       createdOn: FieldValue.serverTimestamp()
     }
 
-    admin.firestore().collection("userCreationRequests").add(userCreationRequest);
+    await admin.firestore().collection("userCreationRequests").add(userCreationRequest);
 
   }catch(error){
     throw new functions.https.HttpsError('Internal', error.message);
