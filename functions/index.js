@@ -121,13 +121,12 @@ exports.adminCreationApproval = functions.https.onCall(async (data, context) => 
         disabled: false
       }
 
-      await userCreationRequestRef.update({ status: 'Processing' });
-
-      await  admin.auth().createUser(newUser);
+      const update_state = await userCreationRequestRef.update({ status: 'Processing' });
+      const create_admin_result = await admin.auth().createUser(newUser);
 
       await userCreationRequestRef.update({ status: 'Treated' });
 
-      return { result: 'The new user has been successfully created.' };
+      return { result: 'The new user has been successfully created.', record: create_admin_result };
 
   } catch (error) {
     if (error.type === 'UnauthenticatedError') {
