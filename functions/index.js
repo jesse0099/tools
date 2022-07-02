@@ -29,6 +29,15 @@ class InvalidRoleError extends Error {
   }
 }
 
+//Already treated account
+class AlreadyTreatedAccount extends Error {
+  constructor(message) {
+    super(message);
+      this.message = message;
+      this.type = 'AlreadyTreatedAccount';  
+  }
+}
+
 // Funciones locales
 // Roles permitidos
 function roleIsValid(role) {
@@ -36,7 +45,44 @@ function roleIsValid(role) {
   return validRoles.includes(role);
 }
 
-// Admin Creation
+//Get Admin Creation Requests
+exports.adminCreationRequests = functions.https.onCall(async (data,context) => {  
+  try {
+      // Checking that the user calling the Cloud Function is authenticated
+      if (!context.auth) {
+        throw new UnauthenticatedError('The user is not authenticated. Only authenticated Admin users can call this function.');
+      }   
+      // Checking that the user calling the Cloud Function is an Admin user
+      const callerUid = context.auth.uid;  //uid of the user calling the Cloud Function
+      const callerUserRecord = await admin.auth().getUser(callerUid);
+      const caller_role = callerUserRecord.customClaims["https://hasura.io/jwt/claims"]["x-hasura-default-role"];
+      
+      var is_admin = false;
+      if(caller_role === "admin" || caller_role === "sa")
+        is_admin = true;
+
+      if (!is_admin) {
+        throw new NotAnAdminError('Only Admin users can read requests.');
+      } 
+
+      var admin_creation_collection = admin.firestore().collection("userCreationRequests");
+      
+      var snapshot = await admin_creation_collection.get();
+
+      return snapshot.docs;
+
+  } catch (error) {
+    if (error.type === 'UnauthenticatedError') {
+      throw new functions.https.HttpsError('unauthenticated', error.message);
+    } else if (error.type === 'NotAnAdminError' || error.type === 'InvalidRoleError') {
+      throw new functions.https.HttpsError('failed-precondition', error.message);
+    } else {
+      throw new functions.https.HttpsError('internal', error.message);
+    }
+  }
+}); 
+
+// Admin Creation Approval
 exports.adminCreationApproval = functions.https.onCall(async (data, context) => {
   try {
       // Checking that the user calling the Cloud Function is authenticated
@@ -59,34 +105,25 @@ exports.adminCreationApproval = functions.https.onCall(async (data, context) => 
       const json_data = JSON.parse(data);
 
       // Checking that the new user role is valid
-      const role = json_data.role;
+      const role = json_data._adminAccountDetail.Role;
       if (!roleIsValid(role)) {
         throw new InvalidRoleError('The "' + role + '" role is not a valid role');
       }
-
-      //FireStore
-      const userCreationRequest = {
-        userDetails: data,
-        userEmail: json_data.email,
-        status: 'Pending',
-        createdBy: callerUid,
-        createdOn: FieldValue.serverTimestamp()
-      }
-
-      const userCreationRequestRef = await admin.firestore().collection("userCreationRequests").add(userCreationRequest);
+      
+      const userCreationRequestRef = admin.firestore()
+        .collection("userCreationRequests").doc(json_data._docId);
 
       const newUser = {
-        email: json_data.email,
+        email: json_data._adminAccountDetail.Email,
         emailVerified: false,
-        password: json_data.password,
-        displayName: json_data.firstName + ' ' + json_data.lastName,
+        password: json_data._adminAccountDetail.Password,
+        displayName: json_data._adminAccountDetail.FirstName + ' ' + json_data._adminAccountDetail.LastName,
         disabled: false
       }
 
-      // Create user
-      const userRecord = await admin
-      .auth()
-      .createUser(newUser);
+      await userCreationRequestRef.update({ status: 'Processing' });
+
+      await  admin.auth().createUser(newUser);
 
       await userCreationRequestRef.update({ status: 'Treated' });
 
@@ -97,30 +134,50 @@ exports.adminCreationApproval = functions.https.onCall(async (data, context) => 
       throw new functions.https.HttpsError('unauthenticated', error.message);
     } else if (error.type === 'NotAnAdminError' || error.type === 'InvalidRoleError') {
       throw new functions.https.HttpsError('failed-precondition', error.message);
-    } else {
+    }else{
       throw new functions.https.HttpsError('internal', error.message);
     }
   }
 });
 
+// Admin Creation Request
 exports.adminCreationRequest = functions.https.onCall(async (data, context) => {
   try { 
-
+    var existent_account = false;
     const json_data = JSON.parse(data);
+    const collection_reference = await admin.firestore().collection("userCreationRequests");
+    const query = collection_reference.where("userEmail", "==", json_data.email)
+      .where("status", "in",['Pending', 'Treated']).get();
 
+    await query.then((snapshot) => {  
+      if(!snapshot.empty)
+          existent_account = true;
+    });
+
+    if (existent_account)
+      throw new AlreadyTreatedAccount("Account already in use");
+      
     //FireStore request data
     const userCreationRequest = {
+      docId: '',
       userDetails: JSON.parse(data),
       userEmail: json_data.email,
       status: 'Pending',
       approvedBy: '',
-      createdOn: FieldValue.serverTimestamp()
-    }
+      createdOn: FieldValue.serverTimestamp(),
+      motive: '',
+    };
 
-    await admin.firestore().collection("userCreationRequests").add(userCreationRequest);
+    const creation_reference = await admin.firestore().collection("userCreationRequests").add(userCreationRequest);
+
+    await creation_reference.update({docId: creation_reference.id});
 
   }catch(error){
-    throw new functions.https.HttpsError('Internal', error.message);
+    if (error.type === "AlreadyTreatedAccount") {
+      throw new functions.https.HttpsError('account_already_treated', error.message);
+    }else{
+      throw new functions.https.HttpsError('internal', error.message);
+    }
   } 
 });
 
@@ -130,8 +187,9 @@ exports.processSignUp = functions.auth.user().onCreate((user, context) => {
       var role;
       var admin_creation_collection = admin.firestore().collection("userCreationRequests");
       // Create a query against the collection.
-      var admin_creation_query = admin_creation_collection.where("userEmail", "==", user.email).get();
-
+      //Consultar estado "Pendiente"
+      var admin_creation_query = admin_creation_collection.where("userEmail", "==", user.email).where('status', '==', 'Processing').get();
+      
       return admin_creation_query.then((query_snapshot) => {
         if(query_snapshot.empty){
           role = "user";
