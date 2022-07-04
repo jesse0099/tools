@@ -45,35 +45,6 @@ function roleIsValid(role) {
   return validRoles.includes(role);
 }
 
-// Escuchando update de firestore
-
-exports.admiCreationApprovalListener = functions.firestore.document('userCreationRequests/{documentId}')
-  .onUpdate((change, context) => {
-    const after = change.after.data();
-    const db = admin.firestore();
-    if (after.status === 'Processing') {
-      const newUser = {
-        email: after.userDetails.email,
-        emailVerified: false,
-        password: after.userDetails.password,
-        displayName: after.userDetails.firstName + ' ' + after.userDetails.lastName,
-        disabled: false
-      };
-
-      return admin.auth().createUser(newUser)
-        .then(() => {
-            return db.collection("userCreationRequests")
-            .doc(context.params.documentId)
-            .update({ status: "Treated" }).then(()=>{
-              return { message: "Treated Object" };
-            });
-        }).catch(error=>{
-          throw new functions.https.HttpsError('internal', error.message);
-        });
-    }else{
-      return { message: "Objeto en tratamiento" };
-    }
-});
 
 //Get Admin Creation Requests
 exports.adminCreationRequests = functions.https.onCall(async (data, context) => {
@@ -139,13 +110,33 @@ exports.adminCreationApproval = functions.https.onCall(async (data, context) => 
     if (!roleIsValid(role)) {
       throw new InvalidRoleError('The "' + role + '" role is not a valid role');
     }
+    const newUser = {
+      email: json_data._adminAccountDetail.Email,
+      emailVerified: false,
+      password: json_data._adminAccountDetail.Password,
+      displayName: json_data._adminAccountDetail.FirstName + ' ' + json_data._adminAccountDetail.LastName,
+      disabled: false
+    };
 
     const userCreationRequestRef = admin.firestore()
       .collection("userCreationRequests").doc(json_data._docId);
 
-    await userCreationRequestRef.update({ status: 'Processing' });
-
-    return { result: 'The new user is being processed.' };
+    userCreationRequestRef.update({ status: 'Processing'}).then((data)=>{
+      admin.auth().createUser(newUser).then((user_record)=>{
+          const new_user_id = user_record.uid;
+          const customClaims = {
+            "https://hasura.io/jwt/claims": {
+              "x-hasura-default-role": "admin",
+              "x-hasura-allowed-roles": ["admin"],
+              "x-hasura-user-id": new_user_id,
+            },
+          };
+          (async () => await admin.auth().setCustomUserClaims(new_user_id, customClaims))().then(()=>{
+            userCreationRequestRef.update({ status: 'Treated', approvedBy: callerUid});
+            return {message: "Admin created"};
+          });
+      });
+    });
 
   } catch (error) {
     if (error.type === 'UnauthenticatedError') {
@@ -192,7 +183,7 @@ exports.adminCreationRequest = functions.https.onCall(async (data, context) => {
 
   } catch (error) {
     if (error.type === "AlreadyTreatedAccount") {
-      throw new functions.https.HttpsError('account_already_treated', error.message);
+      throw new functions.https.HttpsError('already_exists', error.message);
     } else {
       throw new functions.https.HttpsError('internal', error.message);
     }
@@ -200,50 +191,44 @@ exports.adminCreationRequest = functions.https.onCall(async (data, context) => {
 });
 
 // On sign up.
-exports.processSignUp = functions.auth.user().onCreate((user, context) => {
+exports.processSignUp = functions.auth.user().onCreate(async (user, context) => {
   var customClaims = {};
   var role;
   var admin_creation_collection = admin.firestore().collection("userCreationRequests");
   // Create a query against the collection.
   //Consultar estado "Pendiente"
-  var admin_creation_query = admin_creation_collection.where("userEmail", "==", user.email).get();
-
-  return admin_creation_query.then((query_snapshot) => {
-    if (query_snapshot.empty) {
-      role = "user";
-      customClaims = {
-        "https://hasura.io/jwt/claims": {
-          "x-hasura-default-role": "user",
-          "x-hasura-allowed-roles": ["user"],
-          "x-hasura-user-id": user.uid,
-        },
-      };
-    } else {
-      role = "admin";
-      customClaims = {
-        "https://hasura.io/jwt/claims": {
-          "x-hasura-default-role": "admin",
-          "x-hasura-allowed-roles": ["admin"],
-          "x-hasura-user-id": user.uid,
-        },
-      };
-    }
-  }).then(() => {
-
-    return admin
-      .auth()
-      .setCustomUserClaims(user.uid, customClaims)
-      .then(() => {
-        // Update real-time database to notify client to force refresh.
-        const metadataRef = admin.database().ref("metadata/" + user.uid);
-        return metadataRef.set({
-          refreshTime: new Date().getTime(),
-          email: user.email,
-          def_role: role
-        });
-      })
-      .catch((error) => {
-        throw new functions.https.HttpsError('internal', error.message);
+  var admin_creation_query = await admin_creation_collection.where("userEmail", "==", user.email)
+  .where("status", "==", "Processing").get();
+  
+  if (admin_creation_query.empty) {
+    role = "user";
+    customClaims = {
+      "https://hasura.io/jwt/claims": {
+        "x-hasura-default-role": "user",
+        "x-hasura-allowed-roles": ["user"],
+        "x-hasura-user-id": user.uid,
+      },
+    };
+    try {
+      await admin
+        .auth()
+        .setCustomUserClaims(user.uid, customClaims);
+      // Update real-time database to notify client to force refresh.
+      const metadataRef = admin.database().ref("metadata/" + user.uid);
+      return await metadataRef.set({
+        refreshTime: new Date().getTime(),
+        email: user.email,
+        def_role: role
       });
-  });
+    } catch (error) {
+      throw new functions.https.HttpsError('internal', error.message);
+    }
+  }else{
+    const metadataRef = admin.database().ref("metadata/" + user.uid);
+    return await metadataRef.set({
+      refreshTime: new Date().getTime(),
+      email: user.email,
+      def_role: "admin"
+    });
+  }
 });
