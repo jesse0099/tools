@@ -84,13 +84,13 @@ async function isAdminCheck(context) {
 
 // Email Already In Use
 async function isEmailAlreadyInUse(email) {
-  await admin.auth().getUserByEmail(email)
-    .then(() => {
-      return true;
-    })
-    .catch(() => {
-      return false;
-    });
+  var is_in_use = false;
+  await admin.auth().getUserByEmail(email).then(() => {
+    is_in_use = true;
+  }).catch(() => {
+    is_in_use = false;
+  });
+  return is_in_use;
 }
 //Get Admin Creation Requests
 exports.adminCreationRequests = functions.https.onCall(async (data, context) => {
@@ -123,9 +123,17 @@ exports.adminCreationRequests = functions.https.onCall(async (data, context) => 
 // Admin Creation Approval
 exports.adminCreationApproval = functions.https.onCall(async (data, context) => {
   const json_data = JSON.parse(data);
+  const newUser = {
+    email: json_data._adminAccountDetail.Email,
+    emailVerified: false,
+    password: json_data._adminAccountDetail.Password,
+    displayName: json_data._adminAccountDetail.FirstName + ' ' + json_data._adminAccountDetail.LastName,
+    disabled: false
+  };
   var callerUid;
   try {
     var already_treated = false;
+    var reject_request = false;
     // Checking that the user calling the Cloud Function is authenticated
     if (!isAuthenticatedCheck(context))
       throw new UnauthenticatedError('The user is not authenticated. Only authenticated Admin users can create new users.');
@@ -144,50 +152,56 @@ exports.adminCreationApproval = functions.https.onCall(async (data, context) => 
     const userCreationRequestRef = admin.firestore()
       .collection("userCreationRequests").doc(json_data._docId);
 
-    // Begin Transaction
     const db = admin.firestore();
 
     await db.runTransaction(async (t) => {
+      reject_request = false;
+      const doc = await t.get(userCreationRequestRef);
+      const doc_status = doc.data().status;
+      if (doc_status === "Pending")
+        reject_request = true;
+    });
+
+    if (await isEmailAlreadyInUse(json_data._adminAccountDetail.Email))
+      throw new EmailAlreadyInUse("This email is already in use by another account");
+
+
+    // Begin Transaction
+    await db.runTransaction(async (t) => {
       already_treated = false;
-      // Checking if the email is in use
-      if (await isEmailAlreadyInUse(json_data._adminAccountDetail.Email))
-        throw new EmailAlreadyInUse("This email is already in use by another account");
 
       const doc = await t.get(userCreationRequestRef);
       const doc_status = doc.data().status;
 
       // Para simplificar, estoy tirando el mismo tipo de error para cualquier estado diferente de "Pending"
-      if (doc_status in ["Treated", "Rejected", "Processing"])
+      if (doc_status !== "Pending")
         already_treated = true;
 
       if (already_treated)
         throw new AlreadyTreatedAccount("Already Treated Account");
 
-      const newUser = {
-        email: json_data._adminAccountDetail.Email,
-        emailVerified: false,
-        password: json_data._adminAccountDetail.Password,
-        displayName: json_data._adminAccountDetail.FirstName + ' ' + json_data._adminAccountDetail.LastName,
-        disabled: false
+      if (await isEmailAlreadyInUse(json_data._adminAccountDetail.Email)) {
+        if (doc_status === "Pending")
+          reject_request = true;
+        throw new EmailAlreadyInUse("This email is already in use by another account");
+      }
+
+      await t.update(userCreationRequestRef, { status: 'Processing' });
+    });
+    // End Transaction
+    admin.auth().createUser(newUser).then((user_record) => {
+      const new_user_id = user_record.uid;
+      const customClaims = {
+        "https://hasura.io/jwt/claims": {
+          "x-hasura-default-role": "admin",
+          "x-hasura-allowed-roles": ["admin"],
+          "x-hasura-user-id": new_user_id,
+        },
       };
-
-      t.update(userCreationRequestRef, { status: 'Processing' }).then(() => {
-        admin.auth().createUser(newUser).then((user_record) => {
-          const new_user_id = user_record.uid;
-          const customClaims = {
-            "https://hasura.io/jwt/claims": {
-              "x-hasura-default-role": "admin",
-              "x-hasura-allowed-roles": ["admin"],
-              "x-hasura-user-id": new_user_id,
-            },
-          };
-          (async () => await admin.auth().setCustomUserClaims(new_user_id, customClaims))().then(() => {
-            t.update(userCreationRequestRef, { status: 'Treated', approvedBy: callerUid, accessGrantedBy: callerUid });
-            return { message: "Admin created" };
-          });
-        });
+      (async () => await admin.auth().setCustomUserClaims(new_user_id, customClaims))().then(() => {
+        userCreationRequestRef.update({ status: 'Treated', approvedBy: callerUid, accessGrantedBy: callerUid });
+        return { message: "Admin created" };
       });
-
     });
   } catch (error) {
     if (error.type === 'UnauthenticatedError') {
@@ -195,9 +209,14 @@ exports.adminCreationApproval = functions.https.onCall(async (data, context) => 
     } else if (error.type === 'NotAnAdminError' || error.type === 'InvalidRoleError' || error.type === 'AlreadyTreatedAccount') {
       throw new functions.https.HttpsError('failed-precondition', error.message);
     } else if (error.type === 'EmailAlreadyInUse') {
-      const userCreationRequestRefOnError = admin.firestore()
-        .collection("userCreationRequests").doc(json_data._docId);
-      await userCreationRequestRefOnError.update({ status: 'Rejected', approvedBy: callerUid, motive: error.message, accessGrantedBy: callerUid, enabled: false });
+      if (reject_request) {
+        const userCreationRequestRefErr = admin.firestore()
+          .collection("userCreationRequests").doc(json_data._docId);
+        await userCreationRequestRefErr.update({
+          status: 'Rejected', approvedBy: callerUid, motive: "This email is already in use by another account",
+          accessGrantedBy: callerUid, enabled: false
+        });
+      }
       throw new functions.https.HttpsError('failed-precondition', error.message);
     } else {
       throw new functions.https.HttpsError('internal', error.message);
@@ -293,7 +312,7 @@ exports.adminCreationRequest = functions.https.onCall(async (data, context) => {
 });
 
 // Admin Access State Update
-exports.adminAccessStateUpdate = functions.https.onCall(async (data, context) => {  
+exports.adminAccessStateUpdate = functions.https.onCall(async (data, context) => {
   const json_data = JSON.parse(data);
   var already_disabled = false;
   var already_enabled = false;
@@ -370,13 +389,24 @@ exports.adminAccessStateUpdate = functions.https.onCall(async (data, context) =>
 exports.processSignUp = functions.auth.user().onCreate(async (user, context) => {
   var customClaims = {};
   var role;
+  var isAdminRequest = false;
   var admin_creation_collection = admin.firestore().collection("userCreationRequests");
   // Create a query against the collection.
   //Consultar estado "Pendiente"
-  var admin_creation_query = await admin_creation_collection.where("userEmail", "==", user.email)
-    .where("status", "==", "Processing").get();
+  const db = admin.firestore();
+  
+  var admin_creation_query = admin_creation_collection.where("userEmail", "==", user.email)
+  .where("status", "==", "Processing");
+
+  await db.runTransaction(async (t) => {
+    isAdminRequest = false;
+    const doc = await t.get(admin_creation_query);
+    if (!doc.empty)
+      isAdminRequest = true;
+  });
+
   try {
-    if (admin_creation_query.empty) {
+    if (!isAdminRequest) {
       role = "user";
       customClaims = {
         "https://hasura.io/jwt/claims": {
