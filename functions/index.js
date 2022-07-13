@@ -123,6 +123,7 @@ exports.adminCreationRequests = functions.https.onCall(async (data, context) => 
 // Admin Creation Approval
 exports.adminCreationApproval = functions.https.onCall(async (data, context) => {
   const json_data = JSON.parse(data);
+  const db = admin.firestore();
   const newUser = {
     email: json_data._adminAccountDetail.Email,
     emailVerified: false,
@@ -132,7 +133,6 @@ exports.adminCreationApproval = functions.https.onCall(async (data, context) => 
   };
   var callerUid;
   try {
-    var already_treated = false;
     var reject_request = false;
     // Checking that the user calling the Cloud Function is authenticated
     if (!isAuthenticatedCheck(context))
@@ -152,39 +152,21 @@ exports.adminCreationApproval = functions.https.onCall(async (data, context) => 
     const userCreationRequestRef = admin.firestore()
       .collection("userCreationRequests").doc(json_data._docId);
 
-    const db = admin.firestore();
-
-    await db.runTransaction(async (t) => {
-      reject_request = false;
-      const doc = await t.get(userCreationRequestRef);
-      const doc_status = doc.data().status;
-      if (doc_status === "Pending")
-        reject_request = true;
-    });
-
     if (await isEmailAlreadyInUse(json_data._adminAccountDetail.Email))
       throw new EmailAlreadyInUse("This email is already in use by another account");
 
 
     // Begin Transaction
     await db.runTransaction(async (t) => {
-      already_treated = false;
-
       const doc = await t.get(userCreationRequestRef);
       const doc_status = doc.data().status;
 
       // Para simplificar, estoy tirando el mismo tipo de error para cualquier estado diferente de "Pending"
       if (doc_status !== "Pending")
-        already_treated = true;
-
-      if (already_treated)
         throw new AlreadyTreatedAccount("Already Treated Account");
 
-      if (await isEmailAlreadyInUse(json_data._adminAccountDetail.Email)) {
-        if (doc_status === "Pending")
-          reject_request = true;
+      if (await isEmailAlreadyInUse(json_data._adminAccountDetail.Email))
         throw new EmailAlreadyInUse("This email is already in use by another account");
-      }
 
       await t.update(userCreationRequestRef, { status: 'Processing' });
     });
@@ -209,14 +191,18 @@ exports.adminCreationApproval = functions.https.onCall(async (data, context) => 
     } else if (error.type === 'NotAnAdminError' || error.type === 'InvalidRoleError' || error.type === 'AlreadyTreatedAccount') {
       throw new functions.https.HttpsError('failed-precondition', error.message);
     } else if (error.type === 'EmailAlreadyInUse') {
-      if (reject_request) {
-        const userCreationRequestRefErr = admin.firestore()
-          .collection("userCreationRequests").doc(json_data._docId);
-        await userCreationRequestRefErr.update({
-          status: 'Rejected', approvedBy: callerUid, motive: "This email is already in use by another account",
-          accessGrantedBy: callerUid, enabled: false
-        });
-      }
+      const userCreationRequestRefErr = admin.firestore().collection("userCreationRequests").doc(json_data._docId);
+      await db.runTransaction(async (t) => {
+        reject_request = false;
+        const doc = await t.get(userCreationRequestRefErr);
+        const doc_status = doc.data().status;
+        if (doc_status === "Pending") {
+          await t.update(userCreationRequestRefErr, {
+            status: 'Rejected', approvedBy: callerUid, motive: "This email is already in use by another account",
+            accessGrantedBy: callerUid, enabled: false
+          });
+        }
+      });
       throw new functions.https.HttpsError('failed-precondition', error.message);
     } else {
       throw new functions.https.HttpsError('internal', error.message);
@@ -227,6 +213,7 @@ exports.adminCreationApproval = functions.https.onCall(async (data, context) => 
 // Admin Creation Rejection
 exports.adminCreationRejection = functions.https.onCall(async (data, context) => {
   var callerUid;
+  const db = admin.firestore();
   try {
     var already_treated = false;
     // Checking that the user calling the Cloud Function is authenticated
@@ -242,20 +229,20 @@ exports.adminCreationRejection = functions.https.onCall(async (data, context) =>
     const json_data = JSON.parse(data);
 
     const userCreationRequestRef = admin.firestore().collection("userCreationRequests").doc(json_data._docId);
-    const query = userCreationRequestRef.get();
 
-    // Checking document state
-    await query.then((snapshot) => {
-      if (snapshot.data().status === "Treated" || snapshot.data().status === "Rejected")
-        already_treated = true;
+    // Begin Transaction
+    await db.runTransaction(async (t) => {
+      const doc = await t.get(userCreationRequestRef);
+      const doc_status = doc.data().status;
+
+      // Checking document state
+      if (doc_status !== "Pending")
+        throw new AlreadyTreatedAccount("Already Treated Account");
+
+      await t.update(userCreationRequestRef, { status: "Rejected", approvedBy: callerUid, motive: json_data._motive, accessGrantedBy: callerUid, enabled: false });
+      return { message: "User Rejected Successfully" };
     });
-
-    if (already_treated)
-      throw new AlreadyTreatedAccount("Already Treated Account");
-
-    await userCreationRequestRef.update({ status: "Rejected", approvedBy: callerUid, motive: json_data._motive, accessGrantedBy: callerUid, enabled: false });
-
-    return { message: "User Rejected Successfully" };
+    // End Transaction
 
   } catch (error) {
     if (error.type === 'UnauthenticatedError') {
@@ -394,9 +381,9 @@ exports.processSignUp = functions.auth.user().onCreate(async (user, context) => 
   // Create a query against the collection.
   //Consultar estado "Pendiente"
   const db = admin.firestore();
-  
+
   var admin_creation_query = admin_creation_collection.where("userEmail", "==", user.email)
-  .where("status", "==", "Processing");
+    .where("status", "==", "Processing");
 
   await db.runTransaction(async (t) => {
     isAdminRequest = false;
